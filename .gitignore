@@ -1,0 +1,9 @@
+/*
+/*/
+
+!.gitignore
+!LICENSE.txt
+!/Assets/
+!/media/
+!/ProjectSettings/
+!/Packages/

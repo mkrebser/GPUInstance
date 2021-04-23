@@ -1,0 +1,1316 @@
+﻿#pragma kernel CSum1
+#pragma kernel CSum2
+#pragma kernel CSum3
+#pragma kernel CSum4
+#pragma kernel CSum5
+
+#pragma kernel UpdateBuffers
+#pragma kernel MotionUpdate
+#pragma kernel UpdateHierarchy
+#pragma kernel CalcObjectToWorld
+#pragma kernel IndirectIDUpdate
+#pragma kernel UpdateGroupBindPosesBuffer
+#pragma kernel SelectRenderedInstances
+#pragma kernel PrepareRenderedInstances
+#pragma kernel CalculateBoneMatrices
+#pragma kernel UpdatePropertyBuffers
+#pragma kernel IndirectPropertyIDUpdate
+#pragma kernel PropertySimulation
+#pragma kernel UpdatePathsBuffer
+
+#pragma kernel CopyToInstanceBuffers
+#pragma kernel CopyFromInstanceBuffers
+#pragma kernel CopyToSkeletonBuffer
+#pragma kernel CopyFromSkeletonBuffer
+#pragma kernel CopyToHierarchyBuffer
+#pragma kernel CopyFromHierarchyBuffer
+#pragma kernel CopyToBindPoseBuffer
+#pragma kernel CopyFromBindPoseBuffer
+#pragma kernel CopyToPropertyBuffers
+#pragma kernel CopyFromPropertyBuffers
+#pragma kernel CopyToPathsBuffer
+#pragma kernel CopyFromPathsBuffer
+
+#define CULLING_TYPE_NONE 0
+#define CULLING_TYPE_EUCLIDEAN_DISTANCE 1
+#define CULLING_TYPE_UNIFORM_DISTANCE 2
+
+#define ARGS_STRIDE 5  // draw mesh indriect args stride
+#define kThreadGroupX 64
+
+#define ANIMATION_ARGS_COUNT 2 // args count for each bone animation
+#define ANIMATION_STRIDE 10 // length of each element in animation buffer
+
+#define Path_Flags 0
+#define Path_CompletionTime 1
+#define Path_AvgWeight 2
+#define Path_Length 3
+#define Path_NumArgs 4
+#define Path_Flag_Loop 0
+#define Path_Flag_UseConstants 1
+#define Path_Flag_AvgPath 2
+#define Path_Flag_Smoothing 3
+#define Path_Flag_Yaw_Only 4
+#define Path_Flag_Look_At_Camera 5
+
+#define Path_Point_Stride 5
+#define Path_Point_T_Index 3
+#define Path_Point_Up_Index 4
+
+#include "instance_data.cginc"
+
+int DELTA_COUNT; // number of instances added to delta buffer
+int PROPERTY_DELTA_COUNT; // number of property instances added to property delta buffer
+int GROUP_COUNT; // max number of mesh types
+int CULLING_TYPE; // culling type being used
+int HIERARCHY_BUFFER_LEN; // max len of hierarchy buffer at each depth
+int HIERARCHY_DEPTH; // maximum allowed hierarch depth
+int INDIRECT_ID_DELTA_COUNT; // indirect id delta count
+int INDIRECT_PROPERTY_ID_DELTA_COUNT; // indirect property id delta count
+int SKELETON_BONE_COUNT; // constant max number of skeleton bones per skeleton
+int BIND_POSE_DELTA_COUNT; // number of bind poses to be updated
+int PROPERTY_COUNT; // Total number of properties
+int PATH_DELTA_COUNT; // number of paths being updated in delta update
+int PATH_COUNT; // number of points per path
+
+float RADIUS_CULL_RATIO;
+float LOD_QUALITY;
+
+float UNIFORM_CAMERA_DISTANCE; // rather than per-object calculation of distance to camera- a uniform value can be used. This is useful for 2d use cases...
+
+int DELTA_TICKS;
+float TICKS_SECONDS;
+
+// resize buffers- used as temp storage so buffers can have their size increased
+RWStructuredBuffer<int> hierarchyDepthResizeBuffer;
+RWStructuredBuffer<float4x4> object2WorldResizeBuffer;
+RWStructuredBuffer<instance_data> transformResizeBuffer;
+RWStructuredBuffer<int> instanceIDResizeBuffer;
+RWStructuredBuffer<int> indirectInstanceIDResizeBuffer;
+RWStructuredBuffer<float4x4> groupBindPosesResizeBuffer;
+RWStructuredBuffer<float4x4> boneMatricesResizeBuffer;
+RWStructuredBuffer<instance_properties> propertyResizeBuffer;
+RWStructuredBuffer<int> indirectPropertyIDResizeBuffer;
+RWStructuredBuffer<float> pathsResizeBuffer;
+
+RWStructuredBuffer<instance_data> transformBuffer; //all instances
+RWStructuredBuffer<instance_delta> deltaBuffer; //transform updates
+RWStructuredBuffer<int> groupDataBuffer; //buffer storing each groups data (location of group data in the buffer) (the data for each group is theindirect args for DrawIndirect)
+RWStructuredBuffer<uint> argsBuffer; //indirect args buffer used for unity DispatchIndirect
+Buffer<float3> cameraFrustumBuffer; //camera frustum buffer
+RWStructuredBuffer<float> animationsBuffer; //animations buffer- contains animations for all skeletons
+RWStructuredBuffer<int> animToBoneAnimMapBuffer; // animation id + bone index => bone animation id
+RWStructuredBuffer<float> textureAnimationsBuffer; //animations buffer
+RWStructuredBuffer<int> instanceIDBuffer; //instanceIDBuffer so shaders can access instance data. This buffer gets populated every frame with instance ids for each mesh type placed into a contiguous block. (Maps unity_instanceID from DispatchIndirect to instance id)
+
+RWStructuredBuffer<int> indirectInstanceIDBuffer; // (this buffer maps input uint3 id :  SV_DispatchThreadID to instance id)
+RWStructuredBuffer<indirect_id_delta> indirectInstanceIDDeltaBuffer; // used to push updates from the cpu to gpu for this buffer
+
+RWStructuredBuffer<float4x4> boneMatricesBuffer; // final bone matrices * bind pose (used to transform vertices into world space)
+
+RWStructuredBuffer<int> hierarchyDepthBuffer; // 2d array that determines the hierarchy depth of each instance
+RWStructuredBuffer<float4x4> object2WorldBuffer; // contains object to world matrix and its inverse for every instance (inverse only calculated if the object is being rendered for a particular frame)
+RWStructuredBuffer<hierarchy_delta> hierarchyDeltaBuffer; // used to update the hierarchyDepthBuffer
+
+RWStructuredBuffer<float4x4> groupBindPosesBuffer; // array containing skeleton bind poses for each group (MeshType)
+RWStructuredBuffer<float> groupBindPosesDeltaBuffer; // used to push updates to the bind poses buffer. Memory layout: |int: groupID| N*float4x4 |...repeated (note this imposes a smaller max int for id due to float precision)
+
+RWStructuredBuffer<uint> groupLODBuffer; // |lod0|lod1|lod2|lod3|lod4|... repeated for each group. Elements refer to the group id of a mesh type used for a specific lod.
+
+RWStructuredBuffer<instance_properties> propertyBuffer; // buffer that contains all instance properties
+RWStructuredBuffer<instance_properties_delta> propertyDeltaBuffer; // buffer for pushing changes to the properties buffer incrementally
+RWStructuredBuffer<int> indirectPropertyIDBuffer; // (this buffer maps input uint3 id :  SV_DispatchThreadID to property id)
+RWStructuredBuffer<indirect_id_delta> indirectPropertyIDDeltaBuffer; // used to push updates from the cpu to gpu for this buffer
+
+RWStructuredBuffer<float> pathsBuffer; // path buffers
+RWStructuredBuffer<float> pathsDeltaBuffer;
+RWStructuredBuffer<int> pathsDeltaIDBuffer;
+
+float4 globalCameraPosition; //camera position
+float4 globalCameraForward;
+float4 globalCameraUp;
+float4 globalCameraRight;
+int object2WorldDepth; // Used in the CalcObjectToWorld kernel, this value determines what hierarchy depth to update values on. This value is updated before the kernel runs for each depth value[0...MaxDepth]
+int hierarchyNewResizeInstanceCountPerDepth; // used for resizing the hierarchy depth map
+int hierarchyOldResizeInstanceCountPerDepth; // used for resizing the hierarchy depth map
+int instanceCount; // number of existing instances
+
+
+int get_hierarchy_instance_id(int index, int depth)
+{
+  int inst_per_depth = HIERARCHY_BUFFER_LEN;
+  return hierarchyDepthBuffer[inst_per_depth * depth + index];
+}
+void set_hierarchy_instance_id(int index, int depth, int id)
+{
+  int inst_per_depth = HIERARCHY_BUFFER_LEN;
+  hierarchyDepthBuffer[inst_per_depth * depth + index] = id;
+}
+
+int get_group_start(int group_id)
+{
+  // retrieve where in the instanceIDBuffer a contiguous block of group_id (meshtype) will start
+	return group_id == 0 ? 0 : groupDataBuffer[group_id - 1];
+}
+
+float4x4 make_transform_matrix_data(float3 p, float4 r, float3 s) //create transform matrix from position,rotation,scale
+{
+	// transform matrix
+	float xx = r.x * r.x;
+	float xy = r.x * r.y;
+	float xz = r.x * r.z;
+	float xw = r.x * r.w;
+	float yy = r.y * r.y;
+	float yz = r.y * r.z;
+	float yw = r.y * r.w;
+	float zz = r.z * r.z;
+	float zw = r.z * r.w;
+
+	float4x4 m;
+
+	m._11_21_31_41 = float4((1 - 2 * (yy + zz)) * s.x, (2 * (xy + zw)) * s.x, (2 * (xz - yw)) * s.x, 0);
+	m._12_22_32_42 = float4((2 * (xy - zw)) * s.y, (1 - 2 * (xx + zz)) * s.y, (2 * (yz + xw)) * s.y, 0);
+	m._13_23_33_43 = float4((2 * (xz + yw)) * s.z, (2 * (yz - xw)) * s.z, (1 - 2 * (xx + yy)) * s.z, 0);
+	m._14_24_34_44 = float4(p.x, p.y, p.z, 1);
+
+	return m;
+}
+
+float4x4 identity_matrix()
+{
+  float4x4 p;
+  p._11_21_31_41 = float4(1, 0, 0, 0);
+  p._12_22_32_42 = float4(0, 1, 0, 0);
+  p._13_23_33_43 = float4(0, 0, 1, 0);
+  p._14_24_34_44 = float4(0, 0, 0, 1);
+  return p;
+}
+
+bool fequal(float value, float compare)
+{
+	return abs(value - compare) < 0.00001f;
+}
+
+bool fequal_float3(float3 value, float3 compare)
+{
+	return fequal(value.x, compare.x) && fequal(value.y, compare.y) && fequal(value.z, compare.z);
+}
+
+bool fequal_float4(float4 value, float4 compare)
+{
+	return fequal(value.x, compare.x) && fequal(value.y, compare.y) && fequal(value.z, compare.z) && fequal(value.w, compare.w);
+}
+
+//pack color into an integer
+int pack_color(float4 color)
+{
+	return (int(color.x * 255) << 24) | (int(color.y * 255) << 16) |
+		(int(color.z * 255) << 8) | int(color.w * 255);
+}
+
+//multiply two colors that are packed as integers
+int color_mult(int c1, int c2)
+{
+	float4 c1f = float4(float((c1 >> 24) & 255), float((c1 >> 16) & 255),
+		float((c1 >> 8) & 255), float(c1 & 255)) * 0.00392156862f;
+	float4 c2f = float4(float((c2 >> 24) & 255), float((c2 >> 16) & 255),
+		float((c2 >> 8) & 255), float(c2 & 255)) * 0.00392156862f;
+	float4 result = c1f * c2f;
+	return pack_color(result);
+}
+
+float get_camera_distance(float3 world_pos, uint culling_type)
+{
+	//0 means non (so just default to 3d)
+	//1 means 3d distance (returns 3d vector distance to the camera)
+	//2 means 2d distance (returns camera 'y' axis value, if your 2d game uses a different plane, then you may need to change this)
+	return culling_type == CULLING_TYPE_UNIFORM_DISTANCE ? UNIFORM_CAMERA_DISTANCE : length(world_pos - globalCameraPosition.xyz);
+}
+
+//signed distance between a plane and point
+//input 'p' is the point, 'n' is a normalized plane normal, 'plane_point' is some point on the plane
+float signed_point_dist(float3 p, float3 plane_point, float3 n)
+{
+	return dot(n, (p - plane_point));
+}
+
+float4 MulQuaternion(float4 a, float4 b)
+{
+  return float4(a.wwww * b+ (a.xyzx * b.wwwx + a.yzxy * b.zxyy) * float4(1.0, 1.0, 1.0, -1.0) - a.zxyz * b.yzxz);
+}
+
+float4 NormalizeQuaternion(float4 v)
+{
+	float num2 = (((v.x * v.x) + (v.y * v.y)) + (v.z * v.z)) + (v.w * v.w);
+	float num = 1.0f / sqrt(num2);
+	return fequal(num2, 0) ? float4(0, 0, 0, 1) : float4(v.x * num, v.y * num, v.z * num, v.w * num);
+}
+
+float4 QuaternionFromEuler(float3 xyz) // note* zxy ordering
+{
+  float3 s, c;
+  sincos(0.5 * xyz, s, c);
+  return float4(float4(s.xyz, c.x) * c.yxxy * c.zzyz + s.yxxy * s.zzyz * float4(c.xyz, s.x) * float4(1.0, -1.0, -1.0, 1.0));
+}
+
+float4 RotationMatrixToQuaternion(float3x3 m)
+{
+  // shamelessly copied right from unity math library
+  // https://github.com/Unity-Technologies/Unity.Mathematics/blob/4915b7afebc50b9c6c9a410b7a86ae5489aa6b9c/src/Unity.Mathematics/quaternion.cs
+
+  float3 u = m._m00_m10_m20;
+  float3 v = m._m01_m11_m21;
+  float3 w = m._m02_m12_m22;
+
+  uint u_sign = (asuint(u.x) & 0x80000000);
+  float t = v.y + asfloat(asuint(w.z) ^ u_sign);
+  uint4 u_mask = uint4((int)u_sign >> 31, (int)u_sign >> 31, (int)u_sign >> 31, (int)u_sign >> 31);
+  uint4 t_mask = uint4(asint(t) >> 31, asint(t) >> 31, asint(t) >> 31, asint(t) >> 31);
+
+  float tr = 1.0f + abs(u.x);
+
+  uint4 sign_flips = uint4(0x00000000, 0x80000000, 0x80000000, 0x80000000) ^ (u_mask & uint4(0x00000000, 0x80000000, 0x00000000, 0x80000000)) ^ (t_mask & uint4(0x80000000, 0x80000000, 0x80000000, 0x00000000));
+
+  float4 value = float4(tr, u.y, w.x, v.z) + asfloat(asuint(float4(t, v.x, u.z, w.y)) ^ sign_flips);   // +---, +++-, ++-+, +-++
+
+  value = asfloat((asuint(value) & ~u_mask) | (asuint(value.zwxy) & u_mask));
+  value = asfloat((asuint(value.wzyx) & ~t_mask) | (asuint(value) & t_mask));
+  value = normalize(value);
+  return value;
+}
+
+float3x3 RotationMatrixFromDirection(float3 forward, float3 up)
+{ // note* forward and up must be normalized
+  float3 xaxis = normalize(cross(up, forward));
+  float3 yaxis = cross(forward, xaxis);
+  float3x3 m;
+  m._m00_m10_m20 = xaxis;
+  m._m01_m11_m21 = yaxis;
+  m._m02_m12_m22 = forward;
+  return m;
+}
+
+float4 ApplyAngularVelocity(float4 q, float3 w, float dt) // note* zxy ordering
+{
+	if (fequal(dt, 0)) //this is okay because for all threads dt will be '0' or not be '0' (they will all always take the same code path)
+		return q;
+  float4 qw = QuaternionFromEuler(w*dt);
+  return MulQuaternion(q, qw);
+}
+
+//quaternion spherical lerp
+float4 Slerp(float4 v1, float4 v2, float t)
+{
+  float dt = dot(v1, v1);
+  dt = dt < 0 ? -dt : dt;
+  v2 = dt < 0 ? -v2 : v2;
+
+  float angle = acos(dt);
+  float s = 1.0f / sqrt(1.0f - dt * dt);    // 1.0f / sin(angle)
+  float w1 = sin(angle * (1.0f - t)) * s;
+  float w2 = sin(angle * t) * s;
+  float4 res1 = v1 * w1 + v2 * w2;
+
+  float4 lval = v1 + t * (v2 - v1);
+
+  return dt < 0.99995 ? float4(res1.x, res1.y, res1.z, res1.w) : NormalizeQuaternion(lval);
+}
+
+//return 0 if inside camera frustum, returns greater than zero otherwise
+int outside_frustum_count(float3 p, float r)
+{
+	uint outside_count = 0;
+	float neg_r = 0 - r;
+	outside_count += signed_point_dist(p, cameraFrustumBuffer[0], cameraFrustumBuffer[1]) >= neg_r ? 0 : 1;
+	outside_count += signed_point_dist(p, cameraFrustumBuffer[2], cameraFrustumBuffer[3]) >= neg_r ? 0 : 1;
+	outside_count += signed_point_dist(p, cameraFrustumBuffer[4], cameraFrustumBuffer[5]) >= neg_r ? 0 : 1;
+	outside_count += signed_point_dist(p, cameraFrustumBuffer[6], cameraFrustumBuffer[7]) >= neg_r ? 0 : 1;
+	outside_count += signed_point_dist(p, cameraFrustumBuffer[8], cameraFrustumBuffer[9]) >= neg_r ? 0 : 1;
+	outside_count += signed_point_dist(p, cameraFrustumBuffer[10], cameraFrustumBuffer[11]) >= neg_r ? 0 : 1;
+	return outside_count;
+}
+
+//get a bone value at the input keyframe
+float3 BonePosition(int keyFrame, int animation_id)
+{
+	//animation buffer | index(0) = NULL | 4 bytes, num keyframes = N | animation transform, 1...N * 40 bytes | 4 bytes, num keyframes = N | animation transform, 1...N * 40 bytes |  etc... 
+	int StartDataIndex = ANIMATION_ARGS_COUNT + animation_id;
+	int pos = StartDataIndex + ANIMATION_STRIDE * keyFrame;
+	return float3(animationsBuffer[pos], animationsBuffer[pos + 1], animationsBuffer[pos + 2]);
+}
+//get a bone value at the input keyframe
+float4 BoneRotation(int keyFrame, int animation_id)
+{
+	int StartDataIndex = ANIMATION_ARGS_COUNT + animation_id;
+	int pos = StartDataIndex + ANIMATION_STRIDE * keyFrame;
+	return float4(animationsBuffer[pos + 3], animationsBuffer[pos + 4], animationsBuffer[pos + 5],
+		animationsBuffer[pos + 6]);
+}
+//get a bone value at the input keyframe
+float3 BoneScale(int keyFrame, int animation_id)
+{
+	int StartDataIndex = ANIMATION_ARGS_COUNT + animation_id;
+	int pos = StartDataIndex + ANIMATION_STRIDE * keyFrame;
+	return float3(animationsBuffer[pos + 7], animationsBuffer[pos + 8], animationsBuffer[pos + 9]);
+}
+float get_KeyFrameCount(int animation_id)
+{
+	return animationsBuffer[animation_id];
+}
+float get_AnimationLengthSeconds(int animation_id)
+{
+  return  animationsBuffer[animation_id + 1];
+}
+float get_KeyFrameCount_TextureAnimation(int animation_id)
+{
+	return textureAnimationsBuffer[animation_id];
+}
+float get_AnimationClipLength(int animation_id)
+{
+  return animationsBuffer[animation_id + 1];
+}
+
+// Path stuff
+int get_path_buffer_index(int pathID)
+{
+  int pIndex = pathID * (PATH_COUNT * Path_Point_Stride + Path_NumArgs);
+  return pIndex;
+}
+bool get_path_flag(int pIndex, int flag)
+{
+  int val = (int)pathsBuffer[pIndex + Path_Flags];
+  return get_bit(val, flag);
+}
+float3 path_point(int pIndex, int index)
+{
+  int pPointIndex = pIndex + Path_NumArgs + index * Path_Point_Stride;
+  return float3(pathsBuffer[pPointIndex], pathsBuffer[pPointIndex + 1], pathsBuffer[pPointIndex + 2]);
+}
+float4 path_point4(int pIndex, int index)
+{ // get path point assuming that the 't' param is part of the point
+  int pPointIndex = pIndex + Path_NumArgs + index * Path_Point_Stride;
+  return float4(pathsBuffer[pPointIndex], pathsBuffer[pPointIndex + 1], pathsBuffer[pPointIndex + 2], pathsBuffer[pPointIndex + 3]);
+}
+float3 path_unpack_direction(int pIndex, int index)
+{
+  int pointIndex = pIndex + Path_NumArgs + index * Path_Point_Stride;
+  float f = pathsBuffer[pointIndex + Path_Point_Up_Index];
+  int data_int = asint(f);
+  float3 v;
+  v.x = ((data_int >> 16) & 255) * 0.00392156862f * (get_bit(data_int, 24) ? -1 : 1);
+  v.y = ((data_int >> 8) & 255) * 0.00392156862f * (get_bit(data_int, 25) ? -1 : 1);
+  v.z = ((data_int >> 0) & 255) * 0.00392156862f * (get_bit(data_int, 26) ? -1 : 1);
+  return v;
+}
+
+//returns (offsetx, offsety, tilex, tiley) (a uv coordinates to use for this object)
+float2x4 DoTextureAnimation(float t, int texture_animation_id)
+{
+	//texture animations buffer = | index = 0, NULL | 4bytes = frame count | 16 bytes, animation data | 16 bytes color data | 4bytes = frame count | 16 bytes, animation data | 16 bytes color data | etc...
+	int KeyFrameCount = int(get_KeyFrameCount_TextureAnimation(texture_animation_id) + 0.01f); //add 0.1 because of precision
+	int tex_anim_key_frame = int(KeyFrameCount * t); //get desired animation frame
+
+	int texture_animation_stride = 8;
+	int offset = 1 + texture_animation_id + tex_anim_key_frame * texture_animation_stride; //get index in the texture animation buffer
+	float2x4 result;
+	result._11_21 = float2(textureAnimationsBuffer[offset],     textureAnimationsBuffer[offset + 1]);
+	result._12_22 = float2(textureAnimationsBuffer[offset + 2], textureAnimationsBuffer[offset + 3]);
+	result._13_23 = float2(textureAnimationsBuffer[offset + 4], textureAnimationsBuffer[offset + 5]);
+	result._14_24 = float2(textureAnimationsBuffer[offset + 6], textureAnimationsBuffer[offset + 7]);
+	return result;
+}
+
+/// Interpolate animation value. The input value should range from 0 to 1
+float3 InterpPosition(float t, int animation_id)
+{
+	int KeyFrameCount = int(get_KeyFrameCount(animation_id) + 0.01f); //add 0.1 because of precision
+
+	//if one keyframe or less then just return
+	if (KeyFrameCount <= 1)
+		return BonePosition(0, animation_id);
+
+	int k_count = KeyFrameCount - 1;
+	int k_start = int(t * float(k_count));
+	int k_stop = k_start + 1;
+	t = (t * float(k_count)) - float(int(t * float(k_count)));
+
+	//get bone positions
+	float3 start = BonePosition(k_start, animation_id);
+	float3 stop = BonePosition(k_stop, animation_id);
+
+	//return interpolation
+	return float3(
+		t * stop.x + (1 - t) * start.x,
+		t * stop.y + (1 - t) * start.y,
+		t * stop.z + (1 - t) * start.z);
+}
+
+/// Interpolate animation value. The input value should range from 0 to 1
+float3 InterpScale(float t, int animation_id)
+{
+	int KeyFrameCount = int(get_KeyFrameCount(animation_id) + 0.01f);
+
+	//if one keyframe or less hten just return
+	if (KeyFrameCount <= 1)
+		return BoneScale(0, animation_id);
+
+	int k_count = KeyFrameCount - 1;
+	int k_start = int(t * float(k_count));
+	int k_stop = k_start + 1;
+	t = (t * float(k_count)) - float(int(t * float(k_count)));
+
+	//get bone positions
+	float3 start = BoneScale(k_start, animation_id);
+	float3 stop = BoneScale(k_stop, animation_id);
+
+	//return interpolation
+	return float3(
+		t * stop.x + (1 - t) * start.x,
+		t * stop.y + (1 - t) * start.y,
+		t * stop.z + (1 - t) * start.z);
+}
+
+/// SLerp rotation
+float4 InterpRotation(float t, int animation_id)
+{
+	int KeyFrameCount = int(get_KeyFrameCount(animation_id) + 0.01f);
+
+	//if one keyframe or less hten just return
+	if (KeyFrameCount <= 1)
+		return BoneRotation(0, animation_id);
+
+	int k_count = KeyFrameCount - 1;
+	int k_start = int(t * float(k_count));
+	int k_stop = k_start + 1;
+	t = (t * float(k_count)) - float(int(t * float(k_count)));
+
+	//get bone positions
+	float4 start = BoneRotation(k_start, animation_id);
+	float4 stop = BoneRotation(k_stop, animation_id);
+	return Slerp(start, stop, t);
+}
+
+// Animation (and path) time tick calculation
+float CalculateAnimationTicks(bool play_once, float anim_clip_length, uint anim_speed, inout uint instanceTicks)
+{
+  // calculate delta time adjust for animation speed. Note* DELTA_TICKS is assumed to be divisible by '10'
+  uint delta_ticks_adjusted = (DELTA_TICKS * anim_speed) / 10;
+
+  // update time
+  uint anim_clip_ticks = ((uint)anim_clip_length) * 100; // The animation clip length is (LengthInSeconds*100). To convert to 'ticks' seconds must be multiplied by '10000'. ... 10000/100 = 100. So it can just be multiplied by 100 to convert!
+  instanceTicks += delta_ticks_adjusted;
+  instanceTicks = !play_once ? instanceTicks % anim_clip_ticks : (instanceTicks >= anim_clip_ticks ? anim_clip_ticks - 1 : instanceTicks);
+
+  float t = (float)instanceTicks / anim_clip_ticks;
+  return t;
+}
+
+// Smoothly interpolate along paths
+void InterpolatePoints(int pIndex, int index, float t, out float3 position, out float3 direction, bool loop, bool average, float avg_weight, bool smoothing)
+{
+  // reference guide for catmull rom spline https://www.mvps.org/directx/articles/catmull/
+  
+  int count = (int)pathsBuffer[pIndex + Path_Length]; // path length assumed to always be >= 2
+
+  int index_p0 = index - 1 < 0 ? (loop ? count - 1 : index) : index - 1; // indices of 4 points needed for catmull rom
+  int index_p1 = index;
+  int index_p2 = index + 1 >= count ? (loop ? 0 : index) : index + 1;
+  int index_p3 = index_p2 + 1 >= count ? (loop ? 0 : index_p2) : index_p2 + 1;
+
+  int index_p0m1 = index_p0 - 1 < 0 ? (loop ? count - 1 : index_p0) : index_p0 - 1; // extra indices used for the weighted sum
+  int index_p3p1 = index_p3 + 1 >= count ? (loop ? 0 : index_p3) : index_p3 + 1;
+
+  float3 p0 = path_point(pIndex, index_p0);
+  float3 p1 = path_point(pIndex, index_p1);
+  float3 p2 = path_point(pIndex, index_p2);
+  float3 p3 = path_point(pIndex, index_p3);
+  float3 p0m1 = path_point(pIndex, index_p0m1);
+  float3 p3p1 = path_point(pIndex, index_p3p1);
+
+  float avg_weight2 = (1 - avg_weight) * 0.5f; // 'Averaging', if enabled, does a weighted sum of the desired point and its left & right neighbors.
+  bool move_pt = average && (loop || (index != 0));
+  bool move_next_pt = average && (loop || index_p2 < count - 1);
+  float3 p0_avg = average ? (p0m1 + p1) * avg_weight2 + p0 * avg_weight : p0;
+  float3 p1_avg = average && move_pt && move_pt ? (p0 + p2)   * avg_weight2 + p1 * avg_weight : p1;
+  float3 p2_avg = average && move_next_pt ? (p1 + p3)   * avg_weight2 + p2 * avg_weight : p2;
+  float3 p3_avg = average ? (p2 + p3p1) * avg_weight2 + p3 * avg_weight : p3;
+
+  float3 a0 = 2 * p1_avg;
+  float3 a1 = p2_avg - p0_avg;
+  float3 a2 = 2 * p0_avg - 5 * p1_avg + 4 * p2_avg - p3_avg;
+  float3 a3 = 3 * p1_avg - 3 * p2_avg + p3_avg - p0_avg;
+
+  float t_2 = t * t;
+  float t_3 = t_2 * t;
+
+  position = smoothing ? 0.5f * (a0 + a1 * t + a2 * t_2 + a3 * t_3) : p1_avg * (1 - t) + p2_avg * t; // if smoothing-> do catmull rom, otherwise do simple interpolation
+  direction = normalize(smoothing ? 0.5f * (a1 + 2 * a2 * t + 3 * a3 * t_2) : p2_avg - p1_avg); // if smoothing-> do derivative of catmull rom, otherwise just subtract
+}
+void InterpolateUp(int pIndex, int index, float t, bool loop, out float3 up)
+{
+  int count = (int)pathsBuffer[pIndex + Path_Length];
+
+  int index_p0 = index;
+  int index_p1 = index + 1 >= count ? (loop ? 0 : count - 1) : index + 1;
+
+  float3 p0 = path_unpack_direction(pIndex, index_p0);
+  float3 p1 = path_unpack_direction(pIndex, index_p1);
+
+  up = normalize((1 - t) * p0 + t * p1);
+}
+
+// Calculate what index and local interpolation value 't' to use given a global interpolation constant for the entire path
+void CalculatePathIndexAndT(int pIndex, bool loop, float t_global, out int index, out float t)
+{
+  int plen = (int)pathsBuffer[pIndex + Path_Length]; // path length assumed to always be >= 2
+  index = 0;
+  int buffer_index = pIndex + Path_NumArgs + Path_Point_T_Index;
+  for (int i = 0; i < PATH_COUNT; i++) // uniform global for loop, PATH_COUNT assumed always>= 2
+  {
+    index = pathsBuffer[buffer_index] >= t_global ? index : i;
+    buffer_index += Path_Point_Stride; // increment to next point
+  }
+
+  buffer_index = pIndex + Path_NumArgs + (index * Path_Point_Stride) + Path_Point_T_Index;
+  float next_t_val = index + 1 >= plen ? 1.0f : pathsBuffer[buffer_index + Path_Point_Stride];
+  t = (t_global - pathsBuffer[buffer_index]) / (next_t_val - pathsBuffer[buffer_index]);
+}
+
+
+[numthreads(kThreadGroupX, 1, 1)]
+void UpdateBuffers(uint3 id : SV_DispatchThreadID)
+{
+  //this kernal applies deltas (position,rotation,scale, etc updates)
+  //it also resets each groups DrawCount = 0
+
+  if (id.x < (uint)DELTA_COUNT && deltaBuffer[id.x].index > 0)  // only do changes for valid indices
+  {
+    instance_delta tdelta = deltaBuffer[id.x]; //get delta data
+    transformBuffer[tdelta.index] = update_instance_data(transformBuffer[tdelta.index], tdelta);
+    deltaBuffer[id.x] = instance_delta_zero();
+  }
+
+  if (id.x < (uint)GROUP_COUNT) //update all groups arguments
+  {
+    //5 is the number of arguments for each GpuInstance call
+    // + 1 adds an offset of 1 uint because we want to change arg1
+    //we reset the instance count to 0 every frame because it changes every frame (determined by culling, LOD, uder)
+    argsBuffer[id.x * ARGS_STRIDE + 1] = 0; //and 0 is the value being stored >:}
+    groupDataBuffer[id.x] = 0; // reset group start position
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void UpdatePropertyBuffers(uint3 id : SV_DispatchThreadID)
+{
+  // Update propertyBuffer
+  if (id.x < (uint)DELTA_COUNT && propertyDeltaBuffer[id.x].propertyID > 0) // only do changes for valid indices
+  {
+    instance_properties_delta tdelta = propertyDeltaBuffer[id.x]; //get delta data
+    propertyBuffer[tdelta.propertyID] = update_instance_properties(propertyBuffer[tdelta.propertyID], tdelta);
+    propertyDeltaBuffer[id.x] = instance_properties_delta_zero();
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void IndirectIDUpdate(uint3 id : SV_DispatchThreadID)
+{
+  uint delta_count = INDIRECT_ID_DELTA_COUNT;
+  indirect_id_delta delta = indirectInstanceIDDeltaBuffer[id.x];
+  if (id.x < delta_count)
+  {
+    // Update indirect id buffer
+    indirectInstanceIDBuffer[delta.index] = delta.id;
+
+    // Reset buffer
+    delta.id = 0;
+    delta.index = 0;
+    indirectInstanceIDDeltaBuffer[id.x] = delta;
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void IndirectPropertyIDUpdate(uint3 id : SV_DispatchThreadID)
+{
+  uint delta_count = INDIRECT_PROPERTY_ID_DELTA_COUNT;
+  indirect_id_delta delta = indirectPropertyIDDeltaBuffer[id.x];
+  if (id.x < delta_count)
+  {
+    // Update indirect id buffer
+    indirectPropertyIDBuffer[delta.index] = delta.id;
+
+    // Reset buffer
+    delta.id = 0;
+    delta.index = 0;
+    indirectPropertyIDDeltaBuffer[id.x] = delta;
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void UpdateHierarchy(uint3 id :  SV_DispatchThreadID)
+{
+  hierarchy_delta delta = hierarchyDeltaBuffer[id.x];
+  if (delta.dirty != 0)
+  {
+    set_hierarchy_instance_id(delta.index, delta.depth, delta.instance_id); // update
+    // Reset delta at input index
+    hierarchy_delta empty;
+    empty.index = 0;
+    empty.depth = 0;
+    empty.instance_id = 0;
+    empty.dirty = 0;
+    hierarchyDeltaBuffer[id.x] = empty;
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void UpdateGroupBindPosesBuffer(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= (uint)BIND_POSE_DELTA_COUNT)
+  {
+    return;
+  }
+
+  uint buffer_idx = (uint)(SKELETON_BONE_COUNT * 16 + 1) * id.x;
+  int group_id = (int)groupBindPosesDeltaBuffer[buffer_idx];
+  if (group_id > 0)
+  {
+    uint bind_pose_buffer_idx = buffer_idx + 1;
+    for (int i = 0; i < SKELETON_BONE_COUNT; i++)
+    {
+      float4x4 boneMatrix; // bind pose bone matrix
+
+      boneMatrix._m00 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx]; // data in buffer is stored row,col
+      boneMatrix._m01 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 1];
+      boneMatrix._m02 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 2];
+      boneMatrix._m03 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 3];
+      boneMatrix._m10 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 4];
+      boneMatrix._m11 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 5];
+      boneMatrix._m12 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 6];
+      boneMatrix._m13 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 7];
+      boneMatrix._m20 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 8];
+      boneMatrix._m21 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 9];
+      boneMatrix._m22 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 10];
+      boneMatrix._m23 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 11];
+      boneMatrix._m30 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 12];
+      boneMatrix._m31 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 13];
+      boneMatrix._m32 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 14];
+      boneMatrix._m33 = groupBindPosesDeltaBuffer[bind_pose_buffer_idx + 15];
+
+      groupBindPosesBuffer[group_id * SKELETON_BONE_COUNT + i] = boneMatrix; // copy into buffer
+      bind_pose_buffer_idx += 16; // increment to next matrix
+    }
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void UpdatePathsBuffer(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= (uint)PATH_DELTA_COUNT)
+  {
+    return;
+  }
+
+  int path_id = pathsDeltaIDBuffer[id.x];
+  int path_stride = PATH_COUNT * Path_Point_Stride + Path_NumArgs;
+  int path_buffer_idx = path_id * path_stride;
+
+  for (int i = 0; i < path_stride; i++)
+  {
+    pathsBuffer[path_buffer_idx + i] = pathsDeltaBuffer[(id.x * path_stride) + i];
+  }
+}
+
+
+[numthreads(kThreadGroupX, 1, 1)]
+void PropertySimulation(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= (uint)PROPERTY_COUNT)
+  {
+    return;
+  }
+
+  int propertyID = indirectPropertyIDBuffer[id.x];
+  if (propertyBuffer[propertyID].instance_id > 0)
+  {
+    instance_properties props = propertyBuffer[propertyID];
+
+    // Handle animation
+    bool is_texture_anim = get_bit(props.extra, Extra_Flag_Tex_Anim); // check if texture animation
+    bool play_once = get_bit(props.extra, Extra_Flag_Anim_PlayOnce);
+    uint anim_speed = get_animation_speed(props.extra);
+    if (is_texture_anim && props.animationID > 0) // do texture animation
+    {
+      float t = CalculateAnimationTicks(play_once, 100.0, anim_speed, props.instanceTicks); // use '100' which will be 1 second for animation length in seconds
+      float2x4 result = DoTextureAnimation(t, props.animationID);
+      props.offset = result._11_21;
+      props.tiling = result._12_22;
+      props.color = pack_color(float4(result._13_23, result._14_24));
+    }
+    else if (props.animationID > 0)// just update animation ticks for bone animations
+    {
+      int boneAnimID = animToBoneAnimMapBuffer[props.animationID + 0]; // dont actually need a bone... '0' is root bone and all boneAnimations for the same clip will have the same clip length (seconds)!
+      float anim_clip_length = get_AnimationClipLength(boneAnimID);
+      float t = CalculateAnimationTicks(play_once, anim_clip_length, anim_speed, props.instanceTicks);
+    }
+
+    // Handle path
+    if (props.pathID > 0)
+    {
+      int pIndex = get_path_buffer_index(props.pathID);
+      uint path_speed = get_path_speed(props.extra);
+      float path_completion_time = pathsBuffer[pIndex + Path_CompletionTime];
+      bool play_once = !get_path_flag(pIndex, Path_Flag_Loop);
+      bool constant_motion = get_path_flag(pIndex, Path_Flag_UseConstants);
+      float t = CalculateAnimationTicks(play_once, path_completion_time, path_speed, props.pathInstanceTicks);
+      t = t <= 0 ? 0.0000001 : (t >= 1 ? 0.9999999 : t); // exclusive clamp
+
+      if (constant_motion)
+      {
+        float deltaTime = TICKS_SECONDS - path_completion_time; // path completion time for 'use_constants=true' is used as tick start time in seconds
+        float3 start_position = path_point(pIndex, 3);
+        float4 start_rotation = path_point4(pIndex, 2);
+        transformBuffer[props.instance_id].position = start_position + path_point(pIndex, 1) * deltaTime;
+        transformBuffer[props.instance_id].rotation = ApplyAngularVelocity(start_rotation, path_point(pIndex, 0), deltaTime);
+      }
+      else
+      {
+        bool average = get_path_flag(pIndex, Path_Flag_AvgPath);
+        bool smoothing = get_path_flag(pIndex, Path_Flag_Smoothing);
+        bool look_at_camera = get_path_flag(pIndex, Path_Flag_Look_At_Camera);
+        bool yaw_only = get_path_flag(pIndex, Path_Flag_Yaw_Only);
+        float avg_weight = pathsBuffer[pIndex + Path_AvgWeight];
+
+        int index;
+        float t_local;
+        CalculatePathIndexAndT(pIndex, !play_once, t, index, t_local); // get index of point and 'local t' value (ie, interpolate points at index & index+1 using local_t)
+
+        float3 position;
+        float3 direction;
+        InterpolatePoints(pIndex, index, t_local, position, direction, !play_once, average, avg_weight, smoothing); // do interpolation
+
+        float3 up; // 'up' is used as a reference direction so we roughly know which way is up
+        InterpolateUp(pIndex, index, t_local, !play_once, up); // interp up direction
+
+        direction = look_at_camera ? -globalCameraForward.xyz : direction;
+        up = look_at_camera ? globalCameraUp.xyz : up;
+
+        direction = yaw_only ? normalize(float3(direction.x, 0, direction.z)) : direction;
+        up = yaw_only ? float3(0, 1, 0) : up;
+
+        transformBuffer[props.instance_id].position = position;
+        transformBuffer[props.instance_id].rotation = RotationMatrixToQuaternion(RotationMatrixFromDirection(direction, up));
+      }
+    }
+
+    propertyBuffer[propertyID] = props;
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void MotionUpdate(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= (uint)instanceCount) // do nothing for out of bounds
+  {
+    return;
+  }
+
+  int instance_id = indirectInstanceIDBuffer[id.x]; // lookup instance id
+  bool is_bone = get_bit(transformBuffer[instance_id].data1, Data1_Flag_Is_Bone);
+
+  if (is_bone && get_static_group_id(transformBuffer[instance_id].group_ids) > 0 && DELTA_TICKS > 0) //not null and there is a non zero delta time
+  {
+    instance_data data = transformBuffer[instance_id]; // get instance data
+    instance_properties props = propertyBuffer[data.propertyID];
+
+    int animationID = props.animationID;
+    bool is_texture_anim = get_bit(props.extra, Extra_Flag_Tex_Anim); // check if texture animation
+    int bone_lod = get_bone_lod2(data.data2); // lowest lod detail bone can animate at (lod0 is highest detail)
+    int lod = get_lod(data.data1); // current lod of instance
+    bool anim_cull_enabled = get_bit(props.extra, Extra_Flag_Anim_Cull);
+    bool anim_cull = anim_cull_enabled && get_bit(data.data1, Data1_Flag_Is_Culled); // check if animation culled
+    bool disabled_bone_anim = get_bit(data.data1, Data1_Flag_Bone_Anim_Disabled);
+    
+    data.data1 = anim_cull_enabled ? set_bit(data.data1, Data1_Flag_Bone_Anim_Cull) : reset_bit(data.data1, Data1_Flag_Bone_Anim_Cull); // set anim culling from props
+
+    if (animationID > 0 && !is_texture_anim && lod <= bone_lod && !anim_cull && !disabled_bone_anim)
+    {
+      int bone_index = get_bone_index2(data.data2);
+      int boneAnimID = animToBoneAnimMapBuffer[animationID + bone_index];
+
+      float anim_clip_length = get_AnimationClipLength(boneAnimID);
+      float t = (float)props.instanceTicks / (float)(anim_clip_length * 100);
+      t = t <= 0 ? 0.0000001 : (t >= 1 ? 0.9999999 : t); // exclusive clamp
+
+      data.position = InterpPosition(t, boneAnimID); //interp
+      data.rotation = InterpRotation(t, boneAnimID);
+      data.scale = InterpScale(t, boneAnimID);
+    }
+
+    //apply update
+    transformBuffer[instance_id] = data;
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void CalcObjectToWorld(uint3 id :  SV_DispatchThreadID)
+{
+  if (id.x < (uint)instanceCount)
+  {
+    int index = int(id.x);
+    int depth = object2WorldDepth;
+    int instance_id = get_hierarchy_instance_id(index, depth);
+    int parentID = transformBuffer[instance_id].parentID;
+    float4x4 parent2world = parentID > 0 ? object2WorldBuffer[o2w_index(parentID)] : identity_matrix();
+    object2WorldBuffer[o2w_index(instance_id)] = mul(parent2world, make_transform_matrix_data(transformBuffer[instance_id].position, transformBuffer[instance_id].rotation, transformBuffer[instance_id].scale));
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void SelectRenderedInstances(uint3 id :  SV_DispatchThreadID)
+{
+  if (id.x >= (uint)instanceCount) // do nothing for out of bounds
+  {
+    return;
+  }
+  int instance_id = indirectInstanceIDBuffer[id.x];
+
+  //this kernel will sum the number of groups at each groupID
+  //after this, all of the CSum(Cumulative Sum) functions will run
+  //which determine where each group (MeshType) is located in the transformBuffer
+  int static_group_id = get_static_group_id(transformBuffer[instance_id].group_ids);
+  //if groupID != null, then add
+  if (static_group_id > 0)
+  {
+    instance_data myData = transformBuffer[instance_id]; // get instance data
+
+    float3 world_pos = object2WorldBuffer[o2w_index(instance_id)]._14_24_34;
+
+    //clamp radius
+    float r = get_radius(myData.data1);
+    r = r < 1 ? 1 : r;
+
+    // calculate radius / camera distance ratio
+    float rad_distance = r / get_camera_distance(world_pos, CULLING_TYPE);
+
+    // calculate lod level (assuming NUM_LODS == 5)
+    int lod_index = group_lod_index(static_group_id);
+    int lod = 0;
+    for (int i = 1; i < NUM_LODS; i++) // note* loop will unroll (NUM_LODS is constant defined)
+    {
+      lod = rad_distance < lod_radius_ratio(groupLODBuffer[lod_index + NUM_LODS + i]) * LOD_QUALITY ? i : lod;
+    }
+    lod = CULLING_TYPE == CULLING_TYPE_NONE ? 0 : lod; // dont calculate lod if there is no camera to compare with
+
+    //if culling_count > 0 (culling disabled or passed culling test)
+    bool cull = (CULLING_TYPE > CULLING_TYPE_NONE) && //if culling enabled
+      ((outside_frustum_count(world_pos, r) > 0) || //object inside camera frustum
+        rad_distance < RADIUS_CULL_RATIO);  //object has large enough radius/distance ratio
+
+    // Update dynamic group id
+    int old_lod = get_lod(myData.data1);
+    int old_dynamic_group_id = get_dynamic_group_id(myData.group_ids);
+    int dynamic_group_id = lod < old_lod ? old_dynamic_group_id : groupLODBuffer[lod_index + lod];
+    transformBuffer[instance_id].group_ids = set_dynamic_group_id(myData.group_ids, dynamic_group_id);
+
+    // Update culled state on instance
+    myData.data1 = cull ? set_bit(myData.data1, Data1_Flag_Is_Culled) : reset_bit(myData.data1, Data1_Flag_Is_Culled);
+    transformBuffer[instance_id].data1 = myData.data1;
+
+    // Update lod value
+    myData.data1 = set_lod(myData.data1, lod);
+    transformBuffer[instance_id].data1 = myData.data1;
+
+    // render if not culled and not invisible
+    bool is_bone = get_bit(myData.data1, Data1_Flag_Is_Bone);
+    bool render = !cull && !get_bit(myData.data1, Data1_Flag_Invisible);
+    if (render && !is_bone) // render non-bone instance
+    {
+      // Find the number of instances for this group (mesh type) that will be rendered.
+      // This is done via InterloackedAdd into the indirect draw mesh args buffer
+      // Moreover, the increment for each instance is saved- this way the instance id can be retrieved in shaders
+      uint offset;
+      uint index = dynamic_group_id * ARGS_STRIDE;
+      InterlockedAdd(argsBuffer[index + 1], 1, offset);
+      object2WorldBuffer[w2o_index(instance_id)]._11_12 = PackInt(offset); // pack the offset into world2Object (this matrix will be recalculated anyways, so corrupting it doesnt matter)- this way we don't have to do another interlockedAdd
+    }
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void PrepareRenderedInstances(uint3 id :  SV_DispatchThreadID)
+{
+  if (id.x >= (uint)instanceCount) // do nothing for out of bounds
+  {
+    return;
+  }
+
+  int instance_id = indirectInstanceIDBuffer[id.x];
+  int dynamic_group_id = get_dynamic_group_id(transformBuffer[instance_id].group_ids);
+  bool cull = get_bit(transformBuffer[instance_id].data1, Data1_Flag_Is_Culled);
+  bool invisible = get_bit(transformBuffer[instance_id].data1, Data1_Flag_Invisible);
+  bool is_bone = get_bit(transformBuffer[instance_id].data1, Data1_Flag_Is_Bone);
+  if (dynamic_group_id > 0 && !cull && !invisible && !is_bone)
+  {
+    uint startIndex = get_group_start(dynamic_group_id); //get start index
+
+    uint offset = UnPackInt(object2WorldBuffer[w2o_index(instance_id)]._11_12); // unpack offset for instanceID buffer
+    instanceIDBuffer[startIndex + offset] = instance_id; // assign the instance in the instanceID buffer.
+
+    // Calculate inverse matrix for rendered instance
+    float4x4 o2w = object2WorldBuffer[o2w_index(instance_id)];
+    float3x3 w2oRotation;
+    w2oRotation[0] = o2w[1].yzx * o2w[2].zxy - o2w[1].zxy * o2w[2].yzx;
+    w2oRotation[1] = o2w[0].zxy * o2w[2].yzx - o2w[0].yzx * o2w[2].zxy;
+    w2oRotation[2] = o2w[0].yzx * o2w[1].zxy - o2w[0].zxy * o2w[1].yzx;
+    float det = dot(o2w[0].xyz, w2oRotation[0]);
+    w2oRotation = transpose(w2oRotation);
+    w2oRotation *= rcp(det);
+    float3 w2oPosition = mul(w2oRotation, -o2w._14_24_34);
+    float4x4 w2o;
+    w2o._11_21_31_41 = float4(w2oRotation._11_21_31, 0.0f);
+    w2o._12_22_32_42 = float4(w2oRotation._12_22_32, 0.0f);
+    w2o._13_23_33_43 = float4(w2oRotation._13_23_33, 0.0f);
+    w2o._14_24_34_44 = float4(w2oPosition, 1.0f);
+    object2WorldBuffer[w2o_index(instance_id)] = w2o;
+  }
+}
+
+[numthreads(kThreadGroupX, 1, 1)]
+void CalculateBoneMatrices(uint3 id :  SV_DispatchThreadID)
+{
+  if (id.x >= (uint)instanceCount) // do nothing for out of bounds
+  {
+    return;
+  }
+  int instance_id = indirectInstanceIDBuffer[id.x];
+  int static_group_id = get_static_group_id(transformBuffer[instance_id].group_ids);
+  bool cull = get_bit(transformBuffer[instance_id].data1, Data1_Flag_Is_Culled);
+  bool is_bone = get_bit(transformBuffer[instance_id].data1, Data1_Flag_Is_Bone);
+  if (static_group_id > 0 && !cull && is_bone)
+  {
+    // bone instances need to calculate final bone matrices
+    int data2 = transformBuffer[instance_id].data2;
+    int skeletonID = transformBuffer[instance_id].skeletonID;
+    int boneIndex = get_bone_index2(data2);
+    int bType = get_bone_type2(data2);
+    boneMatricesBuffer[skeletonID + boneIndex] =  mul(object2WorldBuffer[o2w_index(instance_id)], groupBindPosesBuffer[bType * SKELETON_BONE_COUNT + boneIndex]);
+    // todo, get skinend mesh world2obj matrix and multiply here, rather than in vertex shader-- with profiling it seems to be slower
+    // note* the skinnedmesh world2object matrix can be retrieved by accessing the propertyBuffer to get its instance id
+  }
+}
+
+
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyToInstanceBuffers(uint3 id : SV_DispatchThreadID)
+{ // copy instance data to new (resized) buffer
+  transformBuffer[id.x] = transformResizeBuffer[id.x];
+  object2WorldBuffer[id.x] = object2WorldResizeBuffer[id.x];
+  instanceIDBuffer[id.x] = instanceIDResizeBuffer[id.x];
+  indirectInstanceIDBuffer[id.x] = indirectInstanceIDResizeBuffer[id.x];
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyFromInstanceBuffers(uint3 id : SV_DispatchThreadID)
+{ // copy instance data to temp buffer
+  transformResizeBuffer[id.x] = transformBuffer[id.x];
+  object2WorldResizeBuffer[id.x] = object2WorldBuffer[id.x];
+  instanceIDResizeBuffer[id.x] = instanceIDBuffer[id.x];
+  indirectInstanceIDResizeBuffer[id.x] = indirectInstanceIDBuffer[id.x];
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyToSkeletonBuffer(uint3 id : SV_DispatchThreadID)
+{ // copy skeletons to new (resized) buffer
+  boneMatricesBuffer[id.x] = boneMatricesResizeBuffer[id.x];
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyFromSkeletonBuffer(uint3 id : SV_DispatchThreadID)
+{ // copy skeletons to temp buffer
+  boneMatricesResizeBuffer[id.x] = boneMatricesBuffer[id.x];
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyToHierarchyBuffer(uint3 id : SV_DispatchThreadID)
+{ // using input old depth indices, move to new depth indices
+  //uint depth = id.x / (uint)hierarchyOldResizeInstanceCountPerDepth; // Note* neither 'depth' NOR 'depth_index' will change for the instance. It is just being moved to an array with more space per depth level.
+  //uint depth_index = id.x - (uint)hierarchyOldResizeInstanceCountPerDepth * depth;
+  //uint index = hierarchyNewResizeInstanceCountPerDepth * depth + depth_index;
+  //hierarchyDepthBuffer[index] = hierarchyDepthResizeBuffer[id.x];
+
+  for (int depth = 0; depth < HIERARCHY_DEPTH; depth++)
+  {
+    uint new_index_1d = hierarchyNewResizeInstanceCountPerDepth * depth + id.x;
+    uint old_index_1d = hierarchyOldResizeInstanceCountPerDepth * depth + id.x;
+    hierarchyDepthBuffer[new_index_1d] = hierarchyDepthResizeBuffer[old_index_1d];
+  }
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyFromHierarchyBuffer(uint3 id : SV_DispatchThreadID)
+{ // copy hierarchy map to temp buffer
+  //hierarchyDepthResizeBuffer[id.x] = hierarchyDepthBuffer[id.x];
+  for (int depth = 0; depth < HIERARCHY_DEPTH; depth++)
+  {
+    uint old_index_1d = hierarchyOldResizeInstanceCountPerDepth * depth + id.x;
+    hierarchyDepthResizeBuffer[old_index_1d] = hierarchyDepthBuffer[old_index_1d];
+  }
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyToBindPoseBuffer(uint3 id : SV_DispatchThreadID)
+{ // copy bind poses to new (resized) buffer
+  groupBindPosesBuffer[id.x] = groupBindPosesResizeBuffer[id.x];
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyFromBindPoseBuffer(uint3 id : SV_DispatchThreadID)
+{ // copy bind poses to temp buffer
+  groupBindPosesResizeBuffer[id.x] = groupBindPosesBuffer[id.x];
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyToPropertyBuffers(uint3 id : SV_DispatchThreadID)
+{ // copy instance data to new (resized) buffer
+  propertyBuffer[id.x] = propertyResizeBuffer[id.x];
+  indirectPropertyIDBuffer[id.x] = indirectPropertyIDResizeBuffer[id.x];
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyFromPropertyBuffers(uint3 id : SV_DispatchThreadID)
+{ // copy instance data to temp buffer
+  propertyResizeBuffer[id.x] = propertyBuffer[id.x];
+  indirectPropertyIDResizeBuffer[id.x] = indirectPropertyIDBuffer[id.x];
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyToPathsBuffer(uint3 id : SV_DispatchThreadID)
+{ // copy instance data to new (resized) buffer
+  int path_stride = PATH_COUNT * Path_Point_Stride + Path_NumArgs;
+  for (int i = 0; i < path_stride; i++)
+  {
+    pathsBuffer[id.x + i] = pathsResizeBuffer[id.x + i];
+  }
+}
+[numthreads(kThreadGroupX, 1, 1)]
+void CopyFromPathsBuffer(uint3 id : SV_DispatchThreadID)
+{ // copy instance data to temp buffer
+  int path_stride = PATH_COUNT * Path_Point_Stride + Path_NumArgs;
+  for (int i = 0; i < PATH_COUNT; i++)
+  {
+    pathsResizeBuffer[id.x + i] = pathsBuffer[id.x + i];
+  }
+}
+
+
+[numthreads(64, 1, 1)]
+void CSum1(uint3 id : SV_DispatchThreadID)
+{
+  // The instanceID buffer holds contiguous blocks of instance ids (one block for every possible group id (mesh type))
+  // An IndirectRenderMesh call will be invoked for each block (mesh type) in the instanceID buffer
+  // The cumulative sum performed will determine where each contiguous block starts in the instanceIDBuffer by summing the indirect instance count arg
+
+  //num groups[4,1,1]
+  //numthreads[64,1,1]
+  int id16 = id.x * 16;
+  int id0 = id16;
+  int id1 = id16 + 1;
+  int id2 = id16 + 2;
+  int id3 = id16 + 3;
+  int id4 = id16 + 4;
+  int id5 = id16 + 5;
+  int id6 = id16 + 6;
+  int id7 = id16 + 7;
+  int id8 = id16 + 8;
+  int id9 = id16 + 9;
+  int id10 = id16 + 10;
+  int id11 = id16 + 11;
+  int id12 = id16 + 12;
+  int id13 = id16 + 13;
+  int id14 = id16 + 14;
+  int id15 = id16 + 15;
+
+  // init group data with the number of instances per group
+  groupDataBuffer[id0] = argsBuffer[id0*ARGS_STRIDE+1];
+  groupDataBuffer[id1] = argsBuffer[id1*ARGS_STRIDE+1];
+  groupDataBuffer[id2] = argsBuffer[id2*ARGS_STRIDE+1];
+  groupDataBuffer[id3] = argsBuffer[id3*ARGS_STRIDE+1];
+  groupDataBuffer[id4] = argsBuffer[id4*ARGS_STRIDE+1];
+  groupDataBuffer[id5] = argsBuffer[id5*ARGS_STRIDE+1];
+  groupDataBuffer[id6] = argsBuffer[id6*ARGS_STRIDE+1];
+  groupDataBuffer[id7] = argsBuffer[id7*ARGS_STRIDE+1];
+  groupDataBuffer[id8] = argsBuffer[id8*ARGS_STRIDE+1];
+  groupDataBuffer[id9] = argsBuffer[id9*ARGS_STRIDE+1];
+  groupDataBuffer[id10] = argsBuffer[id10*ARGS_STRIDE+1];
+  groupDataBuffer[id11] = argsBuffer[id11*ARGS_STRIDE+1];
+  groupDataBuffer[id12] = argsBuffer[id12*ARGS_STRIDE+1];
+  groupDataBuffer[id13] = argsBuffer[id13*ARGS_STRIDE+1];
+  groupDataBuffer[id14] = argsBuffer[id14*ARGS_STRIDE+1];
+  groupDataBuffer[id15] = argsBuffer[id15*ARGS_STRIDE+1];
+
+  // perform cumulative sum
+  groupDataBuffer[id1] += groupDataBuffer[id0];
+  groupDataBuffer[id2] += groupDataBuffer[id1];
+  groupDataBuffer[id3] += groupDataBuffer[id2];
+  groupDataBuffer[id4] += groupDataBuffer[id3];
+  groupDataBuffer[id5] += groupDataBuffer[id4];
+  groupDataBuffer[id6] += groupDataBuffer[id5];
+  groupDataBuffer[id7] += groupDataBuffer[id6];
+  groupDataBuffer[id8] += groupDataBuffer[id7];
+  groupDataBuffer[id9] += groupDataBuffer[id8];
+  groupDataBuffer[id10] += groupDataBuffer[id9];
+  groupDataBuffer[id11] += groupDataBuffer[id10];
+  groupDataBuffer[id12] += groupDataBuffer[id11];
+  groupDataBuffer[id13] += groupDataBuffer[id12];
+  groupDataBuffer[id14] += groupDataBuffer[id13];
+  groupDataBuffer[id15] += groupDataBuffer[id14];
+}
+[numthreads(16, 1, 1)]
+void CSum2(uint3 id : SV_DispatchThreadID)
+{
+	//numgroups[1,1,1]
+	//numthreads[16,1,1]
+	int id256 = id.x * 256;
+	int id0 = id256 + 1 * 16 - 1;
+	int id1 = id256 + 2 * 16 - 1;
+	int id2 = id256 + 3 * 16 - 1;
+	int id3 = id256 + 4 * 16 - 1;
+	int id4 = id256 + 5 * 16 - 1;
+	int id5 = id256 + 6 * 16 - 1;
+	int id6 = id256 + 7 * 16 - 1;
+	int id7 = id256 + 8 * 16 - 1;
+	int id8 = id256 + 9 * 16 - 1;
+	int id9 = id256 + 10 * 16 - 1;
+	int id10 = id256 + 11 * 16 - 1;
+	int id11 = id256 + 12 * 16 - 1;
+	int id12 = id256 + 13 * 16 - 1;
+	int id13 = id256 + 14 * 16 - 1;
+	int id14 = id256 + 15 * 16 - 1;
+	int id15 = id256 + 16 * 16 - 1;
+	groupDataBuffer[id1] += groupDataBuffer[id0];
+	groupDataBuffer[id2] += groupDataBuffer[id1];
+	groupDataBuffer[id3] += groupDataBuffer[id2];
+	groupDataBuffer[id4] += groupDataBuffer[id3];
+	groupDataBuffer[id5] += groupDataBuffer[id4];
+	groupDataBuffer[id6] += groupDataBuffer[id5];
+	groupDataBuffer[id7] += groupDataBuffer[id6];
+	groupDataBuffer[id8] += groupDataBuffer[id7];
+	groupDataBuffer[id9] += groupDataBuffer[id8];
+	groupDataBuffer[id10] += groupDataBuffer[id9];
+	groupDataBuffer[id11] += groupDataBuffer[id10];
+	groupDataBuffer[id12] += groupDataBuffer[id11];
+	groupDataBuffer[id13] += groupDataBuffer[id12];
+	groupDataBuffer[id14] += groupDataBuffer[id13];
+	groupDataBuffer[id15] += groupDataBuffer[id14];
+}
+[numthreads(1, 1, 1)]
+void CSum3(uint3 id : SV_DispatchThreadID)
+{
+	//numgroups[1,1,1]
+	//numthreads[1,1,1]
+	int id0 = 1 * 256 - 1;
+	int id1 = 2 * 256 - 1;
+	int id2 = 3 * 256 - 1;
+	int id3 = 4 * 256 - 1;
+	int id4 = 5 * 256 - 1;
+	int id5 = 6 * 256 - 1;
+	int id6 = 7 * 256 - 1;
+	int id7 = 8 * 256 - 1;
+	int id8 = 9 * 256 - 1;
+	int id9 = 10 * 256 - 1;
+	int id10 = 11 * 256 - 1;
+	int id11 = 12 * 256 - 1;
+	int id12 = 13 * 256 - 1;
+	int id13 = 14 * 256 - 1;
+	int id14 = 15 * 256 - 1;
+	int id15 = 16 * 256 - 1;
+	groupDataBuffer[id1] += groupDataBuffer[id0];
+	groupDataBuffer[id2] += groupDataBuffer[id1];
+	groupDataBuffer[id3] += groupDataBuffer[id2];
+	groupDataBuffer[id4] += groupDataBuffer[id3];
+	groupDataBuffer[id5] += groupDataBuffer[id4];
+	groupDataBuffer[id6] += groupDataBuffer[id5];
+	groupDataBuffer[id7] += groupDataBuffer[id6];
+	groupDataBuffer[id8] += groupDataBuffer[id7];
+	groupDataBuffer[id9] += groupDataBuffer[id8];
+	groupDataBuffer[id10] += groupDataBuffer[id9];
+	groupDataBuffer[id11] += groupDataBuffer[id10];
+	groupDataBuffer[id12] += groupDataBuffer[id11];
+	groupDataBuffer[id13] += groupDataBuffer[id12];
+	groupDataBuffer[id14] += groupDataBuffer[id13];
+	groupDataBuffer[id15] += groupDataBuffer[id14];
+}
+[numthreads(16, 1, 1)]
+void CSum4(uint3 id : SV_DispatchThreadID)
+{
+	//numgroups 1
+	//numthreads[16, 1, 1]
+	if (id.x == 0) //skip the first position since it is always correct
+		return;
+
+	int addsum = groupDataBuffer[id.x * 256 - 1];
+	int id256 = id.x * 256;
+	int id0 = id256 + 1 * 16 - 1;
+	int id1 = id256 + 2 * 16 - 1;
+	int id2 = id256 + 3 * 16 - 1;
+	int id3 = id256 + 4 * 16 - 1;
+	int id4 = id256 + 5 * 16 - 1;
+	int id5 = id256 + 6 * 16 - 1;
+	int id6 = id256 + 7 * 16 - 1;
+	int id7 = id256 + 8 * 16 - 1;
+	int id8 = id256 + 9 * 16 - 1;
+	int id9 = id256 + 10 * 16 - 1;
+	int id10 = id256 + 11 * 16 - 1;
+	int id11 = id256 + 12 * 16 - 1;
+	int id12 = id256 + 13 * 16 - 1;
+	int id13 = id256 + 14 * 16 - 1;
+	int id14 = id256 + 15 * 16 - 1;
+	groupDataBuffer[id0] += addsum;
+	groupDataBuffer[id1] += addsum;
+	groupDataBuffer[id2] += addsum;
+	groupDataBuffer[id3] += addsum;
+	groupDataBuffer[id4] += addsum;
+	groupDataBuffer[id5] += addsum;
+	groupDataBuffer[id6] += addsum;
+	groupDataBuffer[id7] += addsum;
+	groupDataBuffer[id8] += addsum;
+	groupDataBuffer[id9] += addsum;
+	groupDataBuffer[id10] += addsum;
+	groupDataBuffer[id11] += addsum;
+	groupDataBuffer[id12] += addsum;
+	groupDataBuffer[id13] += addsum;
+	groupDataBuffer[id14] += addsum;
+}
+[numthreads(64, 1, 1)]
+void CSum5(uint3 id : SV_DispatchThreadID)
+{
+	//numgroups 1
+	//numthreads[16, 1, 1]
+	if (id.x == 0) //skip the first position since it is always correct
+		return;
+
+	int addsum = groupDataBuffer[id.x * 16 - 1];
+	int id16 = id.x * 16;
+	int id0 = id16;
+	int id1 = id16 + 1;
+	int id2 = id16 + 2;
+	int id3 = id16 + 3;
+	int id4 = id16 + 4;
+	int id5 = id16 + 5;
+	int id6 = id16 + 6;
+	int id7 = id16 + 7;
+	int id8 = id16 + 8;
+	int id9 = id16 + 9;
+	int id10 = id16 + 10;
+	int id11 = id16 + 11;
+	int id12 = id16 + 12;
+	int id13 = id16 + 13;
+	int id14 = id16 + 14;
+	groupDataBuffer[id0] += addsum;
+	groupDataBuffer[id1] += addsum;
+	groupDataBuffer[id2] += addsum;
+	groupDataBuffer[id3] += addsum;
+	groupDataBuffer[id4] += addsum;
+	groupDataBuffer[id5] += addsum;
+	groupDataBuffer[id6] += addsum;
+	groupDataBuffer[id7] += addsum;
+	groupDataBuffer[id8] += addsum;
+	groupDataBuffer[id9] += addsum;
+	groupDataBuffer[id10] += addsum;
+	groupDataBuffer[id11] += addsum;
+	groupDataBuffer[id12] += addsum;
+	groupDataBuffer[id13] += addsum;
+	groupDataBuffer[id14] += addsum;
+}
+
