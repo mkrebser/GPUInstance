@@ -147,3 +147,10 @@ private Path GetNewPath()
 
 ## Other Notes
 * Some of the animations look Jank ASF because I am not an artist- I used Mixamo rigger with all my LODS at once which results in Jank
+* Root animations not supported.
+* Very simple animation state- No animation blending is implemented.
+* If you want though, you can enable/disable animation for select bones and manually pose them yourself. Eg- Have a ragdoll control it or something.
+* Tile textures are supported. You can specify the tiling & offset for the instance to use.
+* There is also an optional per-instance color that you can set.
+* If you want to modify the compute shader and add your own stuff- you can overwrite some of the fields in the property struct safely.
+  * You can overwrite the offset/tiling if you dont need them. You can overwrite the color if you dont need it. You can overwrite the pathInstanceTicks if not using a path. You can overwrite the instanceTicks if not using an animation. The pad2 field is completely unused- you can use it for whatever without any worries.
