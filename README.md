@@ -37,7 +37,7 @@ A scene with many cube instances flying out in all directions.
 
 ## Can Slow down, Speed up, & pause instance times.
 * Just seemed useful for pausing the game.
-TODO: Fix media gif
+![Alt text](https://github.com/mkrebser/GPUInstance/blob/master/media/time.gif "a title")
 
 ## Guide
 This guide will be very basic- you will be expected to look at the demo scenes & demo models to learn how things work. You are expected to already know how to rig your models, create LODS (if you are using them), setup animations, etc...
@@ -144,3 +144,6 @@ private Path GetNewPath()
 * This library has very little CPU overhead. You will only really get CPU overhead from populating the buffers which send data to the GPU.
 * You can create/modify/and destroy instances on different threads than the Unity Main update thread.
 * That being said, thread safety for this library is implented via simple mutual exclusion locks.
+
+## Other Notes
+* Some of the animations look Jank ASF because I am not an artist- I used Mixamo rigger with all my LODS at once which results in Jank
