@@ -22,6 +22,7 @@ A scene with many cube instances flying out in all directions.
 ## Paths
 * An Example of the instancing pathing system. The cubes below are instanced and following paths that are running in a compute shader.
 * The paths being drawn below are just using Debug.DrawLine to show what the paths look like. The spheres are the actual path points. The paths are being automatically blended by the library to be smooth.
+* This isn't a pathfinding solution* The paths (ie like 10 points) are sent to the GPU and the instance will follow it for some period of time. This is useful because the instance wont have to be processed every frame by the CPU. And it won't have to send new matrices to the graphics card every frame.
 ![Alt text](https://raw.githubusercontent.com/mkrebser/GPUInstance/master/media/path.gif "a title")
 
 ## Billboards
