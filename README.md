@@ -31,6 +31,11 @@ A scene with many cube instances flying out in all directions.
 * Below is a scene with a bunch of exploding tile sprites
 ![Alt text](https://github.com/mkrebser/GPUInstance/blob/master/media/explosion_billboards.png "a title")
 
+## Performant Instancing
+* Below is a scene with a half million dynamic asteroids.
+![Alt text](https://github.com/mkrebser/GPUInstance/blob/master/media/asteroids.png "a title")
+
+
 ## Instance Transform Readbacks
 * This library uses a discretized tick system to time all of the instance movement and animations. 
 * Because of this, all of the paths, bones, positions, rotations, and scales of any instance can be lazily calculated at any time without doing GPU readbacks.
