@@ -545,6 +545,99 @@ namespace GPUInstance
         }
 
         /// <summary>
+        /// [Main Thread]  Add a GPUMesh. This will allow for instancing of the desired mesh. This function is somewhat expensive. Try to add all mesh types on start.
+        /// </summary>
+        /// <param name="c">input GPUMeshComponent</param>
+        /// <param name="ignore_already_added_types"> Ignore exceptions for mesh types that have already been added? If true, the existing mesh type will just be retrieved rather than created. </param>
+        /// <param name="override_shadows"> If true, the input shadow_mode & receive_shadows will be used, rather than what is defined by the skin. </param>
+        /// <returns></returns>
+        public MeshType[] AddGPUMeshType(in GPUMeshComponent c, bool ignore_already_added_mesh_types = true, bool override_shadows = false,
+            UnityEngine.Rendering.ShadowCastingMode shadow_mode = UnityEngine.Rendering.ShadowCastingMode.Off, bool receive_shadows = false)
+        {
+            lock (this._instance_lock)
+            {
+                // do a bunch of validation checks, otherwise, bad errors could happen
+                if (!this.Initialized())
+                    throw new System.Exception("Error, the MeshInstancer has not been initialized. Please Initialize it before adding mesh types.");
+                if (ReferenceEquals(c, null) || ReferenceEquals(c.lods, null))
+                    throw new System.Exception("Error, the input GPUMeshComponent is not properly formatted.");
+                if (c.lods.Count <= 0)
+                    throw new System.Exception("Error, there should always be atleast one skin at LOD0 in GPUMeshComponent");
+                if (c.MeshTypes != null && c.MeshTypes.Length > 0)
+                    throw new System.Exception("Error, the input GPUMeshComponent has already been added to the MeshInstancer");
+
+                var num_lods = c.lods.Count;
+                if (num_lods > 5)
+                    throw new System.Exception("Error, maximum of 5 lod levels are support!");
+
+                if (this.mesh.MeshTypeCountRemaining < num_lods)
+                    throw new System.Exception(string.Format("Error, the MeshInstancer has reached a maximum support mesh type count of [{0}] mesh types!", this.mesh.MaxMeshTypes));
+
+
+                if (c.LOD_Radius_Ratios == null || c.LOD_Radius_Ratios.Length != instancemesh.NumLODLevels)
+                    throw new System.Exception("Error, input LOd radius buffer is invalid");
+
+                int total_num_types = 0;
+                for (int lod = 0; lod < c.lods.Count; lod++)
+                {
+                    if (c.lods[lod] != null) total_num_types++;
+                }
+                if (c.lods[0] == null)
+                    throw new System.Exception("Error, LOD0 cannot be null");
+                if (total_num_types <= 0)
+                    throw new System.Exception("Error, the input GPUSkinnedMeshComponent had no skinned mesh components!");
+
+                if (total_num_types > this.mesh.MeshTypeCountRemaining)
+                    throw new System.Exception(string.Format("Error, max mesh type count: [{0}] will be exceeded if the input GPUMeshComponent is added.", this.mesh.MaxMeshTypes));
+
+                // And now we can finnally actually add the mesh types. c.MeshTypes is allocated to NLods
+                c.MeshTypes = new MeshType[instancemesh.NumLODLevels];
+                for (int lod = 0; lod < c.lods.Count; lod++)
+                {
+                    var mesh_renderer = c.lods[lod];
+                    if (mesh_renderer != null)
+                    {
+                        var mesh_filter = mesh_renderer.GetComponent<MeshFilter>();
+                        if (mesh_filter == null)
+                            throw new System.Exception(string.Format("Please Add MeshFilter Component to same game object as MeshRenderer for [{0}]", mesh_renderer.name));
+
+                        // create (or retrieve) mesh types for every single unique skinned mesh
+                        var mesh = mesh_filter.sharedMesh;
+                        var mat = mesh_renderer.sharedMaterial;
+                        var mtype = this.mesh.GetMeshType(mesh, mat);
+
+                        if (ignore_already_added_mesh_types && mtype != null)
+                            throw new System.Exception("Error, input mesh already exists! Cannot add it again!");
+
+                        if (mtype == null) // if null, then a new mesh type needs to be created
+                        {
+                            var mode = override_shadows ? shadow_mode : mesh_renderer.shadowCastingMode;
+                            var rcv_shadow = override_shadows ? receive_shadows : mesh_renderer.receiveShadows;
+                            mtype = this.mesh.AddInstancedMesh(mesh: mesh, mat: mat, mode: mode, receive_shadows: rcv_shadow);
+                        }
+
+                        c.MeshTypes[lod] = mtype;
+                    }
+                }
+
+                // now we just fill null entries in the c.MeshTypes Array
+                for (int lod = 1; lod < instancemesh.NumLODLevels; lod++) // lod 0 is guarenteed to be filled for all skins!
+                {
+                    if (c.MeshTypes[lod] == null)
+                    {
+                        c.MeshTypes[lod] = c.MeshTypes[lod - 1]; // set to previous lod
+                    }
+                }
+
+                // now tell instancemesh object about the LOD relationships
+                this.mesh.AddInstanceLOD(c.MeshTypes[0], c.MeshTypes[1], c.MeshTypes[2], c.MeshTypes[3], c.MeshTypes[4], c.LOD_Radius_Ratios);
+
+                // return the LOD x skin matrix
+                return c.MeshTypes;
+            }
+        }
+
+        /// <summary>
         /// [Main Thread]  Set all animations controllers
         /// </summary>
         /// <param name="all_controller"></param>
