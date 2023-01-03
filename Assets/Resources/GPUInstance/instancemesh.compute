@@ -97,7 +97,7 @@ RWStructuredBuffer<instance_data> transformBuffer; //all instances
 RWStructuredBuffer<instance_delta> deltaBuffer; //transform updates
 RWStructuredBuffer<int> groupDataBuffer; //buffer storing each groups data (location of group data in the buffer) (the data for each group is theindirect args for DrawIndirect)
 RWStructuredBuffer<uint> argsBuffer; //indirect args buffer used for unity DispatchIndirect
-Buffer<float3> cameraFrustumBuffer; //camera frustum buffer
+StructuredBuffer<float3> cameraFrustumBuffer; //camera frustum buffer
 RWStructuredBuffer<float> animationsBuffer; //animations buffer- contains animations for all skeletons
 RWStructuredBuffer<int> animToBoneAnimMapBuffer; // animation id + bone index => bone animation id
 RWStructuredBuffer<float> textureAnimationsBuffer; //animations buffer
