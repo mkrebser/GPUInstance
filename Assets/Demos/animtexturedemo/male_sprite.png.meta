@@ -75,7 +75,7 @@ TextureImporter:
       213: -6294387072706684803
     second: male_sprite_23
   externalObjects: {}
-  serializedVersion: 11
+  serializedVersion: 13
   mipmaps:
     mipMapMode: 0
     enableMipMap: 0
@@ -92,10 +92,12 @@ TextureImporter:
     externalNormalMap: 0
     heightScale: 0.25
     normalMapFilter: 0
+    flipGreenChannel: 0
   isReadable: 0
   streamingMipmaps: 0
   streamingMipmapsPriority: 0
   vTOnly: 0
+  ignoreMipmapLimit: 0
   grayScaleToAlpha: 0
   generateCubemap: 6
   cubemapConvolution: 0
@@ -105,8 +107,8 @@ TextureImporter:
   textureSettings:
     serializedVersion: 2
     filterMode: 0
-    aniso: -1
-    mipBias: -100
+    aniso: 1
+    mipBias: 0
     wrapU: 1
     wrapV: 1
     wrapW: 1
@@ -134,6 +136,8 @@ TextureImporter:
   textureFormatSet: 0
   ignorePngGamma: 0
   applyGammaDecoding: 0
+  swizzle: 50462976
+  cookieLightType: 1
   platformSettings:
   - serializedVersion: 3
     buildTarget: DefaultTexturePlatform
@@ -145,6 +149,7 @@ TextureImporter:
     crunchedCompression: 0
     allowsAlphaSplitting: 0
     overridden: 0
+    ignorePlatformSupport: 0
     androidETC2FallbackOverride: 0
     forceMaximumCompressionQuality_BC6H_BC7: 0
   - serializedVersion: 3
@@ -157,6 +162,7 @@ TextureImporter:
     crunchedCompression: 0
     allowsAlphaSplitting: 0
     overridden: 0
+    ignorePlatformSupport: 0
     androidETC2FallbackOverride: 0
     forceMaximumCompressionQuality_BC6H_BC7: 0
   spriteSheet:
@@ -676,9 +682,33 @@ TextureImporter:
     edges: []
     weights: []
     secondaryTextures: []
-  spritePackingTag: 
+    nameFileIdTable:
+      male_sprite_0: 553400188719508651
+      male_sprite_1: -3997453015747350062
+      male_sprite_10: 2106377340671568274
+      male_sprite_11: -3614719787826342806
+      male_sprite_12: 4426296204883861695
+      male_sprite_13: 9048177825950930237
+      male_sprite_14: -3821553324774166029
+      male_sprite_15: 8962688050844645402
+      male_sprite_16: -6982102185440789885
+      male_sprite_17: 1922116567726897098
+      male_sprite_18: -7993585601175368222
+      male_sprite_19: -6329333250377398519
+      male_sprite_2: -6517505442879120838
+      male_sprite_20: 4110947110889188808
+      male_sprite_21: -2389303166535334954
+      male_sprite_22: -5624389545117596488
+      male_sprite_23: -6294387072706684803
+      male_sprite_3: 1193953126924030411
+      male_sprite_4: -5921923007511657220
+      male_sprite_5: -4077729759898571618
+      male_sprite_6: 6312323975297364746
+      male_sprite_7: -2146248959762826336
+      male_sprite_8: 1089128382299920505
+      male_sprite_9: -3346825650146416854
+  mipmapLimitGroupName: 
   pSDRemoveMatte: 0
-  pSDShowRemoveMatteOption: 0
   userData: 
   assetBundleName: 
   assetBundleVariant: 

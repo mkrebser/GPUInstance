@@ -1,5 +1,5 @@
 # GPUInstance
-Instancing &amp; Animation library for Unity3D
+Instancing &amp; Animation library for Unity3D.
 
 ![Alt text](https://raw.githubusercontent.com/mkrebser/GPUInstance/master/media/crowd.png "a title")
 
@@ -161,3 +161,4 @@ private Path GetNewPath()
 * There is also an optional per-instance color that you can set.
 * If you want to modify the compute shader and add your own stuff- you can overwrite some of the fields in the property struct safely.
   * You can overwrite the offset/tiling if you dont need them. You can overwrite the color if you dont need it. You can overwrite the pathInstanceTicks if not using a path. You can overwrite the instanceTicks if not using an animation. The pad2 field is completely unused- you can use it for whatever without any worries.
+* What version of Unity is supported? Unity 2023.2 is what this project was most recently built with- but it should work for most versions. See *branches* for versions with explicit support.

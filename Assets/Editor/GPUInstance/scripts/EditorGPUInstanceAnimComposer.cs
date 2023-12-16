@@ -95,7 +95,7 @@ namespace GPUAnimation
                 }
                 var animator = animators[0];
 
-                var scene_anims = GameObject.FindObjectsOfType<Animator>();
+                var scene_anims = GameObject.FindObjectsByType<Animator>(FindObjectsSortMode.None);
                 if (scene_anims == null || scene_anims.All(x => x != animator))
                 {
                     Debug.LogWarning(string.Format("[Editor GPU Anim Error] Object: [{0}] must be loaded in the scene hierarchy!", model.name == null ? "" : model.name));
@@ -145,7 +145,7 @@ namespace GPUAnimation
                     return;
                 }
 
-                var scene_transforms = new HashSet<Transform>(GameObject.FindObjectsOfType<Transform>());
+                var scene_transforms = new HashSet<Transform>(GameObject.FindObjectsByType<Transform>(FindObjectsSortMode.None));
                 var model_transforms = model.GetComponentsInChildren<Transform>();
                 if (model_transforms.Any(x => !scene_transforms.Contains(x)))
                 {
