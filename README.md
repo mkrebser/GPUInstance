@@ -149,6 +149,7 @@ private Path GetNewPath()
   * On a GTX 10606GB- All of the demos (using 10-15000 skinned mesh) will run at above 150FPS.
   * Without LOD- Maybe 20-30FPS. There is simply too many animated vertices.
 * This library has very little CPU overhead. You will only really get CPU overhead from populating the buffers which send data to the GPU.
+* Changing the depth of entities with many children can be expensive. If you need to reparent entities with many children, try keeping them at the same hierarchy depth before and after reparenting.
 * You can create/modify/and destroy instances on different threads than the Unity Main update thread.
 * That being said, thread safety for this library is implented via simple mutual exclusion locks.
 
